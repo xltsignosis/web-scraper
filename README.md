@@ -32,7 +32,7 @@ Herramienta de reconocimiento pasivo y auditoría de seguridad web desarrollada 
 
 1. **Clona este repositorio:**
    ```bash
-   git clone [https://github.com/TU_USUARIO/TU_REPOSITORIO.git](https://github.com/TU_USUARIO/TU_REPOSITORIO.git)
+   git clone https://github.com/xltsignosis/web-scraper.git
    cd TU_REPOSITORIO
 
 2. **Crea y activa un entorno virtual (recomendado)**

@@ -3,12 +3,46 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 import json
+import os
 import re
+import socket
+import ssl
 import sys
 from typing import Any
 from urllib.parse import urljoin, urlparse
 import urllib3
 import requests
+
+from report_generator import generate_html_report
+
+
+class Colors:
+    """Códigos ANSI para colorear la salida en terminal (Windows, Linux, macOS)."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+    GRAY = "\033[90m"
+
+    @classmethod
+    def disable(cls):
+        cls.RESET = ""
+        cls.BOLD = ""
+        cls.CYAN = ""
+        cls.GREEN = ""
+        cls.YELLOW = ""
+        cls.RED = ""
+        cls.MAGENTA = ""
+        cls.GRAY = ""
+
+
+def enable_windows_ansi():
+    if os.name == "nt":
+        os.system("")
+
 
 EMAIL_REGEX = re.compile(
     r'\b[a-zA-Z0-9._%+-]+@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,15}\b'
@@ -26,7 +60,6 @@ SCRIPT_TAG_CONTENT_REGEX = re.compile(
     r'<script\b[^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE
 )
 
-# Patrones de rutas y endpoints dentro de código JavaScript o HTML
 JS_API_ENDPOINT_REGEX = re.compile(
     r'["\']((?:/api/|/v[0-9]+/|/graphql|/rest/|/auth/|/admin/|/wp-json/)[^"\'\s<>]{1,150})["\']',
     re.IGNORECASE
@@ -87,7 +120,8 @@ TECH_HEADERS = [
     "X-Drupal-Cache",
     "X-Varnish",
     "Via",
-    "CF-Ray"
+    "CF-Ray",
+    "X-Amz-Cf-Id"
 ]
 
 DEFAULT_USER_AGENT = (
@@ -128,17 +162,27 @@ def build_subdomain_regex(domain: str) -> re.Pattern:
 
 
 class PageHTMLAnalyzer(HTMLParser):
-    """Analizador DOM ligero basado en la librería estándar para extraer enlaces, scripts, formularios y metadatos."""
+    """Analizador DOM ligero basado en la librería estándar para extraer enlaces, scripts, SRI, formularios y metadatos."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, root_domain: str):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
+        self.root_domain = root_domain
         self.links: set[str] = set()
         self.scripts: set[str] = set()
         self.stylesheets: set[str] = set()
         self.forms: list[dict[str, Any]] = []
         self.meta_generators: list[str] = []
+        self.missing_sri: list[dict[str, str]] = []
+        self._seen_sri_urls: set[str] = set()
         self._current_form: dict[str, Any] | None = None
+
+    def _is_external_domain(self, full_url: str) -> bool:
+        parsed = urlparse(full_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
+        host = parsed.netloc.split(":")[0].lower()
+        return host != self.root_domain and not host.endswith("." + self.root_domain)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
         attr_dict = {k.lower(): (v or "") for k, v in attrs if k}
@@ -147,13 +191,24 @@ class PageHTMLAnalyzer(HTMLParser):
         if tag in ("a", "area") and attr_dict.get("href"):
             self.links.add(attr_dict["href"].strip())
         elif tag == "script" and attr_dict.get("src"):
-            self.scripts.add(attr_dict["src"].strip())
+            src = attr_dict["src"].strip()
+            self.scripts.add(src)
+            full_src = urljoin(self.base_url, src)
+            if self._is_external_domain(full_src) and not attr_dict.get("integrity"):
+                if full_src not in self._seen_sri_urls:
+                    self._seen_sri_urls.add(full_src)
+                    self.missing_sri.append({"tag": "script", "url": full_src})
         elif tag == "link":
             rel = attr_dict.get("rel", "").lower()
             href = attr_dict.get("href", "").strip()
             if href:
                 if "stylesheet" in rel:
                     self.stylesheets.add(href)
+                    full_href = urljoin(self.base_url, href)
+                    if self._is_external_domain(full_href) and not attr_dict.get("integrity"):
+                        if full_href not in self._seen_sri_urls:
+                            self._seen_sri_urls.add(full_href)
+                            self.missing_sri.append({"tag": "link[stylesheet]", "url": full_href})
                 else:
                     self.links.add(href)
         elif tag in ("img", "iframe", "embed", "source") and attr_dict.get("src"):
@@ -186,6 +241,145 @@ class PageHTMLAnalyzer(HTMLParser):
         if tag.lower() == "form" and self._current_form is not None:
             self.forms.append(self._current_form)
             self._current_form = None
+
+
+def inspect_tls_certificate(hostname: str, port: int = 443, timeout: int = 8) -> dict[str, Any]:
+    """Inspecciona el certificado SSL/TLS, suite de cifrado, vigencia y nombres alternativos (SAN)."""
+    tls_report: dict[str, Any] = {
+        "enabled": False,
+        "protocol_version": None,
+        "cipher_suite": None,
+        "cipher_bits": None,
+        "subject": None,
+        "issuer": None,
+        "not_before": None,
+        "not_after": None,
+        "days_remaining": None,
+        "san_domains": [],
+        "warnings": []
+    }
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                tls_report["enabled"] = True
+                tls_report["protocol_version"] = ssock.version()
+                cipher = ssock.cipher()
+                if cipher:
+                    tls_report["cipher_suite"] = cipher[0]
+                    tls_report["cipher_bits"] = cipher[2]
+
+                cert = ssock.getpeercert()
+                if cert:
+                    subj = dict(x[0] for x in cert.get("subject", ()))
+                    issuer = dict(x[0] for x in cert.get("issuer", ()))
+                    tls_report["subject"] = subj.get("commonName", hostname)
+                    tls_report["issuer"] = (
+                        f"{issuer.get('organizationName', 'Desconocido')} "
+                        f"({issuer.get('commonName', '')})"
+                    ).strip()
+                    tls_report["not_before"] = cert.get("notBefore")
+                    tls_report["not_after"] = cert.get("notAfter")
+
+                    if cert.get("notAfter"):
+                        try:
+                            exp_dt = datetime.strptime(
+                                cert["notAfter"], "%b %d %H:%M:%S %Y %Z"
+                            ).replace(tzinfo=timezone.utc)
+                            days_left = (exp_dt - datetime.now(timezone.utc)).days
+                            tls_report["days_remaining"] = days_left
+                            if days_left < 0:
+                                tls_report["warnings"].append("El certificado SSL/TLS ha EXPIRADO.")
+                            elif days_left < 20:
+                                tls_report["warnings"].append(
+                                    f"El certificado SSL/TLS está próximo a expirar ({days_left} días restantes)."
+                                )
+                        except ValueError:
+                            pass
+
+                    san = [
+                        val.lower()
+                        for key, val in cert.get("subjectAltName", ())
+                        if key == "DNS"
+                    ]
+                    tls_report["san_domains"] = sorted(set(san))
+
+                if tls_report["protocol_version"] in ("TLSv1", "TLSv1.1", "SSLv3"):
+                    tls_report["warnings"].append(
+                        f"Protocolo TLS obsoleto e inseguro negociado: {tls_report['protocol_version']}."
+                    )
+    except Exception as exc:
+        tls_report["error"] = str(exc)
+
+    return tls_report
+
+
+def fingerprint_technologies(
+    headers: dict[str, str],
+    cookies: list[dict[str, Any]],
+    html: str,
+    url: str,
+    meta_generators: list[str]
+) -> list[str]:
+    """Identifica de forma pasiva el stack tecnológico (WAF, Backend, CMS y librerías JS/CSS)."""
+    detected: set[str] = set()
+    lower_headers = {k.lower(): v.lower() for k, v in headers.items()}
+    cookie_names = {c["name"].lower() for c in cookies}
+    html_lower = html.lower()
+
+    # CDN / WAF
+    if "cf-ray" in lower_headers or "cloudflare" in lower_headers.get("server", "") or "__cf_bm" in cookie_names:
+        detected.add("Cloudflare (CDN/WAF)")
+    if "x-amz-cf-id" in lower_headers:
+        detected.add("AWS CloudFront")
+    if "x-akamai-transformed" in lower_headers or "akamai" in lower_headers.get("server", ""):
+        detected.add("Akamai CDN")
+
+    # Servidor Web
+    srv = headers.get("Server", "")
+    if srv and srv.lower() not in ("cloudflare", "oculto o no configurado"):
+        detected.add(f"Server: {srv}")
+
+    # Lenguajes / Frameworks Backend
+    if "phpsessid" in cookie_names or ".php" in url.lower() or "php" in lower_headers.get("x-powered-by", ""):
+        detected.add("PHP")
+    if "laravel_session" in cookie_names or "xsrf-token" in cookie_names:
+        detected.add("Laravel")
+    if "asp.net_sessionid" in cookie_names or "__viewstate" in html_lower or "x-aspnet-version" in lower_headers:
+        detected.add("ASP.NET")
+    if "csrftoken" in cookie_names or "sessionid" in cookie_names and "django" in html_lower:
+        detected.add("Django (Python)")
+    if "connect.sid" in cookie_names or "express" in lower_headers.get("x-powered-by", ""):
+        detected.add("Express / Node.js")
+    if "jsessionid" in cookie_names:
+        detected.add("Java (Servlet/Spring)")
+
+    # CMS y Plataformas
+    if "/wp-content/" in html_lower or "/wp-includes/" in html_lower:
+        detected.add("WordPress")
+    if "drupal" in html_lower or "x-drupal-cache" in lower_headers:
+        detected.add("Drupal")
+    if "/mod/page/view.php" in html_lower or "moodle" in html_lower:
+        detected.add("Moodle LMS (Integración/Enlaces)")
+
+    # Librerías Frontend
+    if "bootstrap" in html_lower:
+        detected.add("Bootstrap CSS/JS")
+    if "swiper" in html_lower:
+        detected.add("Swiper.js")
+    if "jquery" in html_lower:
+        detected.add("jQuery")
+    if "_next/static" in html_lower:
+        detected.add("Next.js (React)")
+    elif "react" in html_lower and "react-dom" in html_lower:
+        detected.add("React")
+    if "vue.js" in html_lower or "vue.min.js" in html_lower:
+        detected.add("Vue.js")
+
+    for gen in meta_generators:
+        detected.add(f"Generator: {gen}")
+
+    return sorted(detected)
 
 
 def evaluate_security_header_warnings(headers: dict[str, str]) -> list[str]:
@@ -288,7 +482,10 @@ def analyze_cookies(response: requests.Response) -> list[dict[str, Any]]:
     return cookies_report
 
 
-def analyze_headers(response: requests.Response) -> dict[str, Any]:
+def analyze_headers(
+    response: requests.Response,
+    meta_generators: list[str] | None = None
+) -> dict[str, Any]:
     headers = response.headers
     exposed_tech: dict[str, str] = {}
     for tech_header in TECH_HEADERS:
@@ -306,8 +503,10 @@ def analyze_headers(response: requests.Response) -> dict[str, Any]:
 
     warnings = evaluate_security_header_warnings(dict(headers))
     cookies = analyze_cookies(response)
+    detected_stack = fingerprint_technologies(
+        dict(headers), cookies, response.text, response.url, meta_generators or []
+    )
 
-    # Cálculo de puntuación orientativa de cabeceras (0 - 100)
     core_headers = [
         "Content-Security-Policy",
         "Strict-Transport-Security",
@@ -323,6 +522,7 @@ def analyze_headers(response: requests.Response) -> dict[str, Any]:
 
     return {
         "security_score": security_score,
+        "detected_stack": detected_stack,
         "technologies": {
             "server": headers.get("Server", "Oculto o no configurado"),
             "x_powered_by": headers.get("X-Powered-By", "Oculto"),
@@ -350,7 +550,6 @@ def filter_valid_emails(raw_emails: list[str]) -> list[str]:
         lower = email.lower().strip(".")
         if any(lower.endswith(ext) for ext in FALSE_POSITIVE_EMAIL_EXTENSIONS):
             continue
-        # Evitar falsos positivos numéricos tipo version@1.2.3
         domain_part = lower.split("@", 1)[-1]
         if all(part.isdigit() for part in domain_part.split(".")):
             continue
@@ -369,7 +568,6 @@ def extract_comments(html: str) -> list[str]:
             seen.add(cleaned)
             comments.append(cleaned)
 
-    # Extraer comentarios relevantes de bloques <script> inline
     interesting_keywords = (
         "todo", "fixme", "hack", "bug", "nota", "note", "password",
         "secret", "token", "key", "admin", "debug", "api", "deprecated", "cve"
@@ -408,7 +606,6 @@ def classify_urls(
         cleaned = raw.strip()
         if not cleaned or cleaned.lower().startswith(ignored_schemes):
             continue
-        # Ignorar plantillas sin interpolar como ${...} o {{...}}
         if "${" in cleaned or "{{" in cleaned:
             continue
 
@@ -436,16 +633,17 @@ def parse_page(
     html: str,
     target_domain: str,
     base_url: str,
-    response_headers: dict[str, str] | None = None
+    response_headers: dict[str, str] | None = None,
+    san_domains: list[str] | None = None
 ) -> dict[str, Any]:
     root_domain = extract_root_domain(target_domain)
     subdomain_pattern = build_subdomain_regex(root_domain)
 
-    # Buscar subdominios tanto en el HTML como en las cabeceras (ej. CSP)
     headers_text = ""
     if response_headers:
         headers_text = "\n".join(f"{k}: {v}" for k, v in response_headers.items())
-    combined_search_text = html + "\n" + headers_text
+    san_text = "\n".join(san_domains or [])
+    combined_search_text = f"{html}\n{headers_text}\n{san_text}"
 
     subdomains = sorted({
         s.lower() for s in subdomain_pattern.findall(combined_search_text)
@@ -456,8 +654,7 @@ def parse_page(
 
     comments = extract_comments(html)
 
-    # Analizar DOM con HTMLParser + regex de respaldo
-    dom_analyzer = PageHTMLAnalyzer(base_url)
+    dom_analyzer = PageHTMLAnalyzer(base_url, root_domain)
     try:
         dom_analyzer.feed(html)
     except Exception:
@@ -476,7 +673,6 @@ def parse_page(
 
     secrets = find_secrets(html)
 
-    # Verificar formularios inseguros (sin CSRF o que envían por HTTP)
     forms_summary = []
     for form in dom_analyzer.forms:
         form_warnings = []
@@ -497,6 +693,7 @@ def parse_page(
         "static_assets": static_assets,
         "external_links": external_links,
         "forms": forms_summary,
+        "missing_sri": dom_analyzer.missing_sri,
         "meta_generators": dom_analyzer.meta_generators,
         "comments": comments,
         "secrets": secrets
@@ -506,7 +703,6 @@ def parse_page(
 def scan_javascript_files(
     session: requests.Session,
     static_assets: list[str],
-    root_domain: str,
     timeout: int,
     verify_ssl: bool,
     max_files: int = 10
@@ -515,7 +711,10 @@ def scan_javascript_files(
     js_urls = [
         u for u in static_assets
         if urlparse(u).path.lower().endswith(".js")
-        and not any(lib in u.lower() for lib in ("bootstrap.bundle.min.js", "bootstrap.min.js", "jquery.min.js", "swiper-bundle.min.js", "popper.min.js"))
+        and not any(lib in u.lower() for lib in (
+            "bootstrap.bundle.min.js", "bootstrap.min.js", "jquery.min.js",
+            "swiper-bundle.min.js", "popper.min.js"
+        ))
     ][:max_files]
 
     js_secrets: dict[str, list[str]] = {}
@@ -557,18 +756,69 @@ def scan_javascript_files(
     }
 
 
+def crawl_subpages(
+    session: requests.Session,
+    endpoints: list[str],
+    initial_url: str,
+    root_domain: str,
+    max_pages: int,
+    timeout: int,
+    verify_ssl: bool
+) -> dict[str, Any]:
+    """Rastrea de forma controlada hasta N subpáginas internas para descubrir formularios, correos o secretos."""
+    priority_keywords = ("login", "signin", "auth", "admin", "contacto", "contact", "registro", "register", "user")
+    candidates = [u for u in endpoints if u.rstrip("/") != initial_url.rstrip("/")]
+    candidates.sort(key=lambda u: (0 if any(k in u.lower() for k in priority_keywords) else 1, len(u)))
+    targets = candidates[:max_pages]
+
+    pages_crawled: list[dict[str, Any]] = []
+    extra_forms: list[dict[str, Any]] = []
+    extra_emails: set[str] = set()
+    extra_secrets: dict[str, list[str]] = {}
+
+    for url in targets:
+        try:
+            resp = session.get(url, timeout=timeout, verify=verify_ssl)
+            if "text/html" not in resp.headers.get("Content-Type", "").lower():
+                continue
+            sub_data = parse_page(resp.text, root_domain, resp.url)
+            pages_crawled.append({
+                "url": resp.url,
+                "status_code": resp.status_code,
+                "forms_count": len(sub_data["forms"]),
+                "comments_count": len(sub_data["comments"]),
+                "secrets_count": len(sub_data["secrets"])
+            })
+            extra_forms.extend(sub_data["forms"])
+            extra_emails.update(sub_data["emails"])
+            for s_type, hits in sub_data["secrets"].items():
+                curr = set(extra_secrets.get(s_type, []))
+                curr.update(hits)
+                extra_secrets[s_type] = sorted(curr)
+        except requests.RequestException:
+            continue
+
+    return {
+        "pages_crawled": pages_crawled,
+        "discovered_forms": extra_forms,
+        "discovered_emails": sorted(extra_emails),
+        "discovered_secrets": extra_secrets
+    }
+
+
 def check_auxiliary_files(
     session: requests.Session,
     base_url: str,
     timeout: int,
     verify_ssl: bool
 ) -> dict[str, Any]:
-    """Comprueba de forma pasiva la existencia de robots.txt y security.txt."""
+    """Comprueba de forma pasiva la existencia de robots.txt, security.txt y sitemap.xml."""
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     aux_results: dict[str, Any] = {
         "robots_txt": {"present": False, "url": f"{origin}/robots.txt", "disallowed_paths": []},
-        "security_txt": {"present": False, "url": f"{origin}/.well-known/security.txt"}
+        "security_txt": {"present": False, "url": f"{origin}/.well-known/security.txt"},
+        "sitemap_xml": {"present": False, "url": f"{origin}/sitemap.xml", "urls_count": 0}
     }
 
     try:
@@ -589,6 +839,15 @@ def check_auxiliary_files(
     except requests.RequestException:
         pass
 
+    try:
+        sm_resp = session.get(aux_results["sitemap_xml"]["url"], timeout=timeout, verify=verify_ssl)
+        if sm_resp.status_code == 200 and "<urlset" in sm_resp.text.lower() or "<sitemapindex" in sm_resp.text.lower():
+            aux_results["sitemap_xml"]["present"] = True
+            locs = re.findall(r'<loc>(.*?)</loc>', sm_resp.text, re.IGNORECASE)
+            aux_results["sitemap_xml"]["urls_count"] = len(locs)
+    except requests.RequestException:
+        pass
+
     return aux_results
 
 
@@ -598,65 +857,83 @@ def print_terminal_results(
     redirect_chain: list[str],
     header_data: dict[str, Any],
     page_data: dict[str, Any],
+    tls_data: dict[str, Any] | None = None,
     aux_data: dict[str, Any] | None = None,
-    js_data: dict[str, Any] | None = None
+    js_data: dict[str, Any] | None = None,
+    crawl_data: dict[str, Any] | None = None
 ):
-    print("\n" + "=" * 68)
-    print(f" [*] AUDITORÍA DE SEGURIDAD WEB Y RECONOCIMIENTO PASIVO")
-    print("=" * 68)
-    print(f"  Objetivo       : {url}")
+    C = Colors
+    score = header_data["security_score"]
+    score_color = C.GREEN if score >= 80 else (C.YELLOW if score >= 55 else C.RED)
+
+    print(f"\n{C.CYAN}{'=' * 70}{C.RESET}")
+    print(f"{C.BOLD} [*] AUDITORÍA DE SEGURIDAD WEB Y RECONOCIMIENTO PASIVO{C.RESET}")
+    print(f"{C.CYAN}{'=' * 70}{C.RESET}")
+    print(f"  Objetivo       : {C.BOLD}{url}{C.RESET}")
     print(f"  Estado HTTP    : {status_code}")
     print(f"  Dominio Raíz   : {page_data['root_domain']}")
-    print(f"  Puntuación Sec : {header_data['security_score']}/100")
+    print(f"  Puntuación Sec : {score_color}{C.BOLD}{score}/100{C.RESET}")
+    if header_data.get("detected_stack"):
+        print(f"  Stack Detectado: {C.MAGENTA}{', '.join(header_data['detected_stack'])}{C.RESET}")
     if redirect_chain:
         print(f"  Redirecciones  : {' -> '.join(redirect_chain)}")
 
-    print("\n" + "=" * 68)
-    print(" [*] 1. AUDITORÍA DE CABECERAS HTTP Y COOKIES")
-    print("=" * 68)
+    if tls_data and tls_data.get("enabled"):
+        print(f"\n{C.CYAN}{'=' * 70}{C.RESET}")
+        print(f"{C.BOLD} [*] 1. CERTIFICADO SSL/TLS Y CIFRADO{C.RESET}")
+        print(f"{C.CYAN}{'=' * 70}{C.RESET}")
+        print(f"  - Protocolo    : {C.GREEN}{tls_data['protocol_version']}{C.RESET}")
+        print(f"  - Cipher Suite : {tls_data['cipher_suite']} ({tls_data['cipher_bits']} bits)")
+        print(f"  - Emisor (CA)  : {tls_data['issuer']}")
+        print(f"  - Vigencia     : Hasta {tls_data['not_after']} ({tls_data['days_remaining']} días restantes)")
+        print(f"  - Dominios SAN : {', '.join(tls_data['san_domains'][:8])}")
+        for w in tls_data.get("warnings", []):
+            print(f"  {C.YELLOW}[WARN] {w}{C.RESET}")
+
+    print(f"\n{C.CYAN}{'=' * 70}{C.RESET}")
+    print(f"{C.BOLD} [*] 2. AUDITORÍA DE CABECERAS HTTP Y COOKIES{C.RESET}")
+    print(f"{C.CYAN}{'=' * 70}{C.RESET}")
 
     tech = header_data["technologies"]
-    print(f"\n[+] Tecnologías expuestas en cabeceras:")
+    print(f"\n[+] Cabeceras de infraestructura:")
     print(f"  - Server       : {tech['server']}")
     print(f"  - X-Powered-By : {tech['x_powered_by']}")
     for k, v in tech.get("all_exposed_headers", {}).items():
         if k not in ("Server", "X-Powered-By"):
             print(f"  - {k:<12} : {v}")
-    if page_data.get("meta_generators"):
-        print(f"  - Meta Generator: {', '.join(page_data['meta_generators'])}")
 
     print(f"\n[+] Cabeceras de seguridad activas ({len(header_data['present_security_headers'])}):")
     if header_data["present_security_headers"]:
         for h, val in header_data["present_security_headers"].items():
-            short_val = val if len(val) <= 75 else val[:72] + "..."
-            print(f"  [OK] {h}: {short_val}")
+            short_val = val if len(val) <= 72 else val[:69] + "..."
+            print(f"  {C.GREEN}[OK]{C.RESET} {h}: {short_val}")
     else:
-        print("  - Ninguna cabecera de seguridad detectada.")
+        print(f"  {C.RED}- Ninguna cabecera de seguridad detectada.{C.RESET}")
 
     if header_data["header_warnings"]:
         print(f"\n[!] Advertencias de configuración en cabeceras ({len(header_data['header_warnings'])}):")
         for warn in header_data["header_warnings"]:
-            print(f"  [WARN] {warn}")
+            print(f"  {C.YELLOW}[WARN]{C.RESET} {warn}")
 
     if header_data["missing_security_headers"]:
         print(f"\n[-] Cabeceras de seguridad ausentes ({len(header_data['missing_security_headers'])}):")
         for h, desc in header_data["missing_security_headers"].items():
-            print(f"  [MISSING] {h} -> {desc}")
+            print(f"  {C.RED}[MISSING]{C.RESET} {h} -> {desc}")
 
     cookies = header_data.get("cookies_analysis", [])
     print(f"\n[+] Análisis de Cookies ({len(cookies)}):")
     if cookies:
         for c in cookies:
-            status = "[OK]" if not c["issues"] else "[WARN]"
+            status = f"{C.GREEN}[OK]{C.RESET}" if not c["issues"] else f"{C.YELLOW}[WARN]{C.RESET}"
             print(f"  {status} Cookie '{c['name']}' (Secure={c['secure']}, HttpOnly={c['httponly']}, SameSite={c['samesite']})")
             for issue in c["issues"]:
                 print(f"         * {issue}")
     else:
         print("  - No se recibieron cabeceras Set-Cookie en esta respuesta.")
 
-    print("\n" + "=" * 68)
-    print(f" [*] 2. ANÁLISIS DE CÓDIGO FUENTE Y SUPERFICIE WEB")
-    print("=" * 68)
+    print(f"\n{C.CYAN}{'=' * 70}{C.RESET}")
+    print(f"{C.BOLD} [*] 3. ANÁLISIS DE CÓDIGO FUENTE, SRI Y SUPERFICIE WEB{C.RESET}")
+    print(f"{C.CYAN}{'=' * 70}{C.RESET}")
 
     print(f"\n[!] Subdominios detectados ({len(page_data['subdomains'])}):")
     if page_data["subdomains"]:
@@ -672,80 +949,101 @@ def print_terminal_results(
     else:
         print("  - No se detectaron correos electrónicos expuestos.")
 
+    print(f"\n[!] Integridad de Subrecursos Externos - SRI ({len(page_data['missing_sri'])} sin integrity):")
+    if page_data["missing_sri"]:
+        for item in page_data["missing_sri"]:
+            print(f"  {C.YELLOW}[SIN SRI]{C.RESET} <{item['tag']}> {item['url']}")
+    else:
+        print(f"  {C.GREEN}[OK]{C.RESET} Todos los recursos de CDNs externos usan Subresource Integrity (o son locales).")
+
     print(f"\n[!] Posibles Secretos / Tokens expuestos ({len(page_data['secrets'])} categorías):")
     if page_data["secrets"]:
         for sec_type, hits in page_data["secrets"].items():
-            print(f"  [ALERTA] {sec_type}:")
+            print(f"  {C.RED}[ALERTA] {sec_type}:{C.RESET}")
             for item in hits:
                 masked = item if len(item) < 15 else item[:8] + "..." + item[-4:]
                 print(f"    * {masked}")
     else:
-        print("  - No se detectaron patrones conocidos de claves o tokens en el HTML.")
+        print(f"  {C.GREEN}[OK]{C.RESET} No se detectaron patrones conocidos de claves o tokens en el HTML.")
 
     print(f"\n[!] Endpoints y Rutas de aplicación ({len(page_data['endpoints'])}):")
-    for ep in page_data["endpoints"][:40]:
+    for ep in page_data["endpoints"][:30]:
         print(f"  - {ep}")
-    if len(page_data["endpoints"]) > 40:
-        print(f"  ... y {len(page_data['endpoints']) - 40} endpoints más (disponibles en el reporte JSON).")
-
-    print(f"\n[!] Recursos estáticos locales ({len(page_data['static_assets'])}):")
-    for asset in page_data["static_assets"][:15]:
-        print(f"  - {asset}")
-    if len(page_data["static_assets"]) > 15:
-        print(f"  ... y {len(page_data['static_assets']) - 15} archivos estáticos más.")
+    if len(page_data["endpoints"]) > 30:
+        print(f"  ... y {len(page_data['endpoints']) - 30} endpoints más.")
 
     if page_data["forms"]:
         print(f"\n[!] Formularios HTML detectados ({len(page_data['forms'])}):")
         for idx, form in enumerate(page_data["forms"], 1):
-            warn_str = f" | Alertas: {', '.join(form['warnings'])}" if form["warnings"] else " | OK"
+            warn_str = f" | {C.YELLOW}Alertas: {', '.join(form['warnings'])}{C.RESET}" if form["warnings"] else f" | {C.GREEN}OK{C.RESET}"
             print(f"  [{idx}] {form['method']} -> {form['action']} ({len(form['inputs'])} inputs){warn_str}")
 
     print(f"\n[!] Comentarios en HTML y JS inline ({len(page_data['comments'])}):")
-    for idx, c in enumerate(page_data["comments"][:25], 1):
+    for idx, c in enumerate(page_data["comments"][:20], 1):
         single_line = " ".join(c.split())
-        preview = single_line if len(single_line) < 120 else single_line[:117] + "..."
+        preview = single_line if len(single_line) < 115 else single_line[:112] + "..."
         print(f"  [{idx}] {preview}")
-    if len(page_data["comments"]) > 25:
-        print(f"  ... y {len(page_data['comments']) - 25} comentarios más.")
+    if len(page_data["comments"]) > 20:
+        print(f"  ... y {len(page_data['comments']) - 20} comentarios más.")
 
     if aux_data:
-        print("\n" + "=" * 68)
-        print(" [*] 3. ARCHIVOS AUXILIARES (robots.txt / security.txt)")
-        print("=" * 68)
+        print(f"\n{C.CYAN}{'=' * 70}{C.RESET}")
+        print(f"{C.BOLD} [*] 4. ARCHIVOS AUXILIARES (robots.txt / security.txt / sitemap.xml){C.RESET}")
+        print(f"{C.CYAN}{'=' * 70}{C.RESET}")
         robots = aux_data["robots_txt"]
         sec_txt = aux_data["security_txt"]
+        sitemap = aux_data["sitemap_xml"]
         print(f"  - robots.txt   : {'Encontrado' if robots['present'] else 'No disponible'} ({robots['url']})")
         if robots["disallowed_paths"]:
             print(f"    Rutas Disallow ({len(robots['disallowed_paths'])}): {', '.join(robots['disallowed_paths'][:10])}")
         print(f"  - security.txt : {'Encontrado' if sec_txt['present'] else 'No disponible'} ({sec_txt['url']})")
+        print(f"  - sitemap.xml  : {'Encontrado (' + str(sitemap['urls_count']) + ' URLs)' if sitemap['present'] else 'No disponible'} ({sitemap['url']})")
 
     if js_data and js_data.get("scanned_files"):
-        print("\n" + "=" * 68)
-        print(f" [*] 4. ESCANEO DE ARCHIVOS JAVASCRIPT ({len(js_data['scanned_files'])} analizados)")
-        print("=" * 68)
+        print(f"\n{C.CYAN}{'=' * 70}{C.RESET}")
+        print(f"{C.BOLD} [*] 5. ESCANEO DE ARCHIVOS JAVASCRIPT ({len(js_data['scanned_files'])} analizados){C.RESET}")
+        print(f"{C.CYAN}{'=' * 70}{C.RESET}")
         if js_data["secrets"]:
             for sec_type, hits in js_data["secrets"].items():
-                print(f"  [ALERTA JS] {sec_type}: {len(hits)} hallazgo(s)")
+                print(f"  {C.RED}[ALERTA JS] {sec_type}: {len(hits)} hallazgo(s){C.RESET}")
         else:
-            print("  - Sin secretos detectados en los archivos JS analizados.")
+            print(f"  {C.GREEN}[OK]{C.RESET} Sin secretos detectados en los archivos JS analizados.")
         if js_data["api_endpoints"]:
             print(f"  - Endpoints API en JS ({len(js_data['api_endpoints'])}):")
             for ep in js_data["api_endpoints"][:15]:
                 print(f"    * {ep}")
 
+    if crawl_data and crawl_data.get("pages_crawled"):
+        print(f"\n{C.CYAN}{'=' * 70}{C.RESET}")
+        print(f"{C.BOLD} [*] 6. RASTREO DE SUBPÁGINAS INTERNAS ({len(crawl_data['pages_crawled'])} visitadas){C.RESET}")
+        print(f"{C.CYAN}{'=' * 70}{C.RESET}")
+        for p in crawl_data["pages_crawled"]:
+            print(
+                f"  - [{p['status_code']}] {p['url']} "
+                f"(Formularios: {p['forms_count']}, Comentarios: {p['comments_count']})"
+            )
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auditor web pasivo: cabeceras OWASP, cookies, secretos, formularios, JS y exportación JSON."
+        description="Auditor web pasivo: cabeceras OWASP, TLS, SRI, cookies, secretos, formularios, JS y reportes JSON/HTML."
     )
     parser.add_argument("-u", "--url", required=True, help="URL objetivo (ej. https://ejemplo.com)")
     parser.add_argument("-o", "--output", help="Ruta de archivo JSON donde guardar el informe completo.")
+    parser.add_argument("--html", help="Ruta de archivo HTML donde generar el reporte visual ejecutivo (ej. reporte.html).")
     parser.add_argument("-t", "--timeout", type=int, default=12, help="Tiempo máximo de espera en segundos (por defecto: 12).")
+    parser.add_argument("--crawl", type=int, default=0, metavar="N", help="Visitar hasta N subpáginas internas descubiertas (ej. --crawl 5).")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent personalizado para las peticiones HTTP.")
     parser.add_argument("--insecure", action="store_true", help="Ignorar errores de validación de certificados SSL/TLS.")
     parser.add_argument("--scan-js", action="store_true", help="Analizar también archivos JavaScript locales en busca de secretos y endpoints.")
-    parser.add_argument("--no-aux", action="store_true", help="Omitir la consulta de robots.txt y security.txt.")
+    parser.add_argument("--no-aux", action="store_true", help="Omitir la consulta de robots.txt, security.txt y sitemap.xml.")
+    parser.add_argument("--no-color", action="store_true", help="Desactivar colores ANSI en la terminal.")
     args = parser.parse_args()
+
+    if args.no_color:
+        Colors.disable()
+    else:
+        enable_windows_ansi()
 
     target_url = args.url.strip()
     parsed_url = urlparse(target_url)
@@ -781,14 +1079,22 @@ def main():
 
     redirect_chain = [r.url for r in response.history] + ([response.url] if response.history else [])
     final_url = response.url
+    final_host = urlparse(final_url).netloc.split(":")[0]
 
-    headers_result = analyze_headers(response)
+    tls_result = None
+    if urlparse(final_url).scheme == "https":
+        tls_result = inspect_tls_certificate(final_host, 443, min(args.timeout, 8))
+
+    san_domains = tls_result.get("san_domains", []) if tls_result else []
+
     page_result = parse_page(
         response.text,
-        domain,
+        final_host,
         final_url,
-        dict(response.headers)
+        dict(response.headers),
+        san_domains
     )
+    headers_result = analyze_headers(response, page_result["meta_generators"])
 
     aux_result = None
     if not args.no_aux:
@@ -799,7 +1105,18 @@ def main():
         js_result = scan_javascript_files(
             session,
             page_result["static_assets"],
+            args.timeout,
+            verify_ssl
+        )
+
+    crawl_result = None
+    if args.crawl > 0:
+        crawl_result = crawl_subpages(
+            session,
+            page_result["endpoints"],
+            final_url,
             page_result["root_domain"],
+            args.crawl,
             args.timeout,
             verify_ssl
         )
@@ -810,30 +1127,42 @@ def main():
         redirect_chain,
         headers_result,
         page_result,
+        tls_result,
         aux_result,
-        js_result
+        js_result,
+        crawl_result
     )
 
+    full_report = {
+        "scan_timestamp": datetime.now(timezone.utc).isoformat(),
+        "target_url": target_url,
+        "final_url": final_url,
+        "redirect_chain": redirect_chain,
+        "domain": final_host,
+        "root_domain": page_result["root_domain"],
+        "status_code": response.status_code,
+        "tls_analysis": tls_result,
+        "headers_analysis": headers_result,
+        "recon_data": page_result,
+        "auxiliary_files": aux_result,
+        "js_analysis": js_result,
+        "crawl_analysis": crawl_result
+    }
+
     if args.output:
-        full_report = {
-            "scan_timestamp": datetime.now(timezone.utc).isoformat(),
-            "target_url": target_url,
-            "final_url": final_url,
-            "redirect_chain": redirect_chain,
-            "domain": domain,
-            "root_domain": page_result["root_domain"],
-            "status_code": response.status_code,
-            "headers_analysis": headers_result,
-            "recon_data": page_result,
-            "auxiliary_files": aux_result,
-            "js_analysis": js_result
-        }
         try:
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(full_report, f, indent=4, ensure_ascii=False)
-            print(f"\n[+] Informe JSON guardado con éxito en: {args.output}")
+            print(f"\n{Colors.GREEN}[+] Informe JSON guardado con éxito en: {args.output}{Colors.RESET}")
         except OSError as e:
             print(f"[-] Error al guardar el archivo JSON: {e}", file=sys.stderr)
+
+    if args.html:
+        try:
+            generate_html_report(full_report, args.html)
+            print(f"{Colors.GREEN}[+] Reporte visual HTML generado con éxito en: {args.html}{Colors.RESET}")
+        except OSError as e:
+            print(f"[-] Error al guardar el reporte HTML: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

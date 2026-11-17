@@ -1,39 +1,45 @@
 # Web Recon & Security Header Auditor
 
-Herramienta de reconocimiento pasivo y auditoría de seguridad web desarrollada en Python. Permite inspeccionar aplicaciones web para evaluar su postura defensiva mediante el análisis profundo de cabeceras HTTP (OWASP), auditoría de cookies (`Secure`, `HttpOnly`, `SameSite`), extracción clasificada de endpoints y formularios, detección de comentarios en HTML/JavaScript y búsqueda de posibles secretos o tokens expuestos.
+Herramienta modular de reconocimiento pasivo y auditoría de seguridad web desarrollada en Python. Permite inspeccionar aplicaciones web para evaluar su postura defensiva mediante el análisis profundo de cabeceras HTTP (OWASP), inspección de certificados SSL/TLS, auditoría de cookies (`Secure`, `HttpOnly`, `SameSite`), verificación de *Subresource Integrity* (SRI), *fingerprinting* tecnológico, extracción clasificada de endpoints y formularios, y generación de reportes ejecutivos en **JSON** y **HTML**.
 
 ---
 
-## Características
+## Características Principales
 
-* **Auditoría avanzada de cabeceras HTTP (OWASP) y puntuación de seguridad:**
+* **Inspección de Certificado SSL/TLS y Cifrado (`ssl` + `socket`):**
+  * Verifica la versión del protocolo negociado (`TLSv1.3`, `TLSv1.2`), suite de cifrado (*Cipher Suite*), entidad emisora (CA) y días restantes antes de la expiración.
+  * Extrae automáticamente todos los dominios y subdominios listados en la extensión **SAN (*Subject Alternative Names*)** del certificado.
+* **Auditoría avanzada de cabeceras HTTP (OWASP) y puntuación (`0-100`):**
   * Verificación de cabeceras defensivas: `Content-Security-Policy`, `Strict-Transport-Security` (HSTS), `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy` (COOP) y `Cross-Origin-Resource-Policy` (CORP).
   * **Evaluación de configuración débil:** Detecta directivas riesgosas en cabeceras activas (`'unsafe-inline'`, `'unsafe-eval'`, orígenes `http://` en CSP, `max-age` corto en HSTS, políticas CORS abiertas `*`).
-  * Detección de fuga de información tecnológica (`Server`, `X-Powered-By`, `X-AspNet-Version`, `X-Generator`, `<meta name="generator">`).
-* **Auditoría de Cookies (`Set-Cookie`):**
+* **Huella Tecnológica (*Passive Stack Fingerprinting*):**
+  * Identifica automáticamente CDN/WAF (Cloudflare, CloudFront, Akamai), lenguajes de backend (PHP, Laravel, ASP.NET, Django, Express, Java) y CMS/librerías (WordPress, Moodle, Drupal, Bootstrap, Swiper, jQuery, React, Vue).
+* **Auditoría de Cookies (`Set-Cookie`) e Integridad de Subrecursos (`SRI` - OWASP A08):**
   * Inspección de cada cookie devuelta para verificar las banderas `Secure`, `HttpOnly` y `SameSite`.
-* **Reconocimiento estructurado en código fuente (`HTMLParser` + Regex):**
-  * Separación limpia entre **endpoints/rutas de aplicación**, **recursos estáticos** (`.js`, `.css`, imágenes) y **enlaces externos**.
-  * Identificación de subdominios en el HTML y en las cabeceras HTTP (como `Content-Security-Policy`), normalizando dominios raíz compuestos (ej. `.gob.mx`, `.com.mx`).
+  * Detecta scripts (`<script>`) y hojas de estilo (`<link>`) cargados desde CDNs externos que carecen del atributo criptográfico `integrity="sha..."`.
+* **Reconocimiento estructurado en DOM (`HTMLParser` + Regex) y Mini-Crawler (`--crawl`):**
+  * Separación limpia entre **endpoints/rutas de aplicación**, **recursos estáticos** y **enlaces externos**.
   * Auditoría pasiva de **formularios HTML (`<form>`)**, identificando métodos (`GET`/`POST`), rutas de envío y posible ausencia de tokens CSRF.
-  * Detección de correos electrónicos filtrando falsos positivos comunes (como nombres de imágenes `@2x.png` o versiones de paquetes).
-  * Extracción de comentarios HTML (`<!-- ... -->`) y comentarios de desarrollo olvidados en bloques `<script>` (`/* ... */` y `// ...`).
-* **Escaneo pasivo de credenciales, secretos y archivos JavaScript (`--scan-js`):**
-  * Detección de Google API Keys, JWTs, AWS Access Keys, GitHub Tokens, Slack/Discord Webhooks, Stripe Keys, claves privadas y asignaciones de secretos en código.
-  * Opción `--scan-js` para analizar de forma concurrente archivos `.js` locales en busca de endpoints de API (`/api/`, `/v1/`, `/graphql`) y credenciales.
-* **Comprobación de archivos auxiliares:**
-  * Revisión automática de `/robots.txt` (extrayendo rutas `Disallow`) y `/.well-known/security.txt`.
+  * Opción `--crawl N` para visitar automáticamente hasta `N` subpáginas internas (priorizando rutas de login, contacto o administración) y analizar sus formularios y comentarios.
+* **Escaneo de secretos, archivos JavaScript (`--scan-js`) y archivos auxiliares:**
+  * Detección de Google API Keys, JWTs, AWS Access Keys, GitHub Tokens, Slack/Discord Webhooks, Stripe Keys, claves privadas y asignaciones de credenciales.
+  * Revisión automática de `/robots.txt`, `/.well-known/security.txt` y `/sitemap.xml`.
+* **Generador de Reporte Ejecutivo en HTML (`report_generator.py`):**
+  * Exporta un dashboard visual en HTML (`--html reporte.html`) con calificación (`A` - `F`), tablas coloreadas por severidad y diseño optimizado para imprimir directamente a PDF desde el navegador (`Ctrl + P`).
 
 ---
 
-## Requisitos
+## Estructura del Proyecto
+
+* `web-scanner.py` — Motor principal de auditoría, análisis DOM/TLS/HTTP, mini-crawler y CLI con colores ANSI.
+* `report_generator.py` — Generador de reportes ejecutivos en HTML listos para navegador o exportación PDF.
+
+---
+
+## Requisitos e Instalación
 
 * Python 3.10 o superior.
 * Paquete `requests` (`pip install requests`).
-
----
-
-## Instalación
 
 1. **Clona este repositorio:**
    ```bash
@@ -62,25 +68,28 @@ Herramienta de reconocimiento pasivo y auditoría de seguridad web desarrollada 
 
 ## Uso
 
-### Escaneo estándar
+### 1. Escaneo estándar en terminal
 ```bash
 python web-scanner.py -u https://ejemplo.com
 ```
 
-### Escaneo completo con análisis de archivos JavaScript y exportación a JSON
+### 2. Escaneo completo con reporte visual HTML, JSON, análisis JS y mini-crawler
 ```bash
-python web-scanner.py -u https://ejemplo.com --scan-js -o reporte.json
+python web-scanner.py -u https://ejemplo.com --scan-js --crawl 3 -o reporte.json --html reporte.html
 ```
 
 ### Opciones disponibles
 | Parámetro | Descripción |
 | :--- | :--- |
 | `-u`, `--url` | URL objetivo (obligatorio, incluye `http://` o `https://`). |
-| `-o`, `--output` | Ruta del archivo JSON donde exportar el reporte completo. |
-| `-t`, `--timeout` | Tiempo máximo de espera por petición en segundos (por defecto: `12`). |
+| `-o`, `--output` | Ruta del archivo JSON donde exportar el reporte técnico completo. |
+| `--html` | Ruta del archivo HTML donde generar el reporte visual ejecutivo (ej. `reporte.html`). |
+| `--crawl N` | Visita hasta `N` subpáginas internas descubiertas (ej. `--crawl 5`). |
 | `--scan-js` | Descarga y analiza archivos `.js` del mismo dominio en busca de secretos y endpoints de API. |
-| `--no-aux` | Omite la verificación de `/robots.txt` y `/.well-known/security.txt`. |
-| `--insecure` | Ignora errores de certificado SSL/TLS (útil en entornos de prueba con certificados autofirmados). |
+| `-t`, `--timeout` | Tiempo máximo de espera por petición en segundos (por defecto: `12`). |
+| `--no-aux` | Omite la verificación de `/robots.txt`, `/.well-known/security.txt` y `/sitemap.xml`. |
+| `--insecure` | Ignora errores de certificado SSL/TLS (útil en entornos de laboratorio con certificados autofirmados). |
+| `--no-color` | Desactiva los colores ANSI en la salida de la terminal. |
 | `--user-agent` | Define un `User-Agent` personalizado para las peticiones HTTP. |
 
 ---

@@ -180,17 +180,71 @@ def generate_html_report(report: dict[str, Any], output_path: str) -> None:
     if crawl_info and crawl_info.get("pages_crawled"):
         c_rows = ""
         for p in crawl_info["pages_crawled"]:
+            sec_cnt = p.get("secrets_count", 0)
+            sec_cell = f'<span class="badge badge-danger">{sec_cnt}</span>' if sec_cnt else "0"
             c_rows += f"""
             <tr>
                 <td><code>{_esc(p.get('status_code'))}</code></td>
                 <td class="mono">{_esc(p.get('url'))}</td>
                 <td>{_esc(p.get('forms_count', 0))}</td>
                 <td>{_esc(p.get('comments_count', 0))}</td>
-                <td>{_esc(p.get('secrets_count', 0))}</td>
+                <td>{sec_cell}</td>
             </tr>"""
+
+        crawl_secrets_html = ""
+        c_secrets = crawl_info.get("discovered_secrets", {})
+        if c_secrets:
+            cs_items = ""
+            for s_type, hits in c_secrets.items():
+                masked_list = ", ".join(
+                    f"<code>{_esc(h if len(h) < 15 else h[:8] + '...' + h[-4:])}</code>"
+                    for h in hits
+                )
+                cs_items += f"<li><strong>{_esc(s_type)}:</strong> {masked_list}</li>"
+            crawl_secrets_html = f"""
+            <div class="alert alert-danger">
+                <h4>🚨 Secretos / Claves API descubiertos en subpáginas</h4>
+                <ul>{cs_items}</ul>
+            </div>"""
+
+        crawl_forms_html = ""
+        c_forms = crawl_info.get("discovered_forms", [])
+        if c_forms:
+            cf_rows = ""
+            for f in c_forms:
+                f_warns = f.get("warnings", [])
+                f_badge = '<span class="badge badge-warn">REVISAR</span>' if f_warns else '<span class="badge badge-ok">OK</span>'
+                inputs_desc = ", ".join(
+                    f"{_esc(i.get('name') or '(sin nombre)')} [{_esc(i.get('type'))}]"
+                    for i in f.get("inputs", [])
+                ) or "Sin campos"
+                cf_rows += f"""
+                <tr>
+                    <td>{f_badge}</td>
+                    <td><code>{_esc(f.get('method'))}</code></td>
+                    <td class="mono">{_esc(f.get('action'))}</td>
+                    <td>{inputs_desc}</td>
+                    <td>{"<br>".join(_esc(w) for w in f_warns) or "Sin alertas"}</td>
+                </tr>"""
+            crawl_forms_html = f"""
+            <h3 style="margin-top:20px;">Formularios descubiertos en subpáginas ({len(c_forms)})</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:110px;">Estado</th>
+                        <th style="width:90px;">Método</th>
+                        <th>Action URL</th>
+                        <th>Campos (Inputs)</th>
+                        <th>Alertas</th>
+                    </tr>
+                </thead>
+                <tbody>{cf_rows}</tbody>
+            </table>"""
+
         crawl_section = f"""
         <section class="card">
             <h2>7. Rastreo de Subpáginas Internas (--crawl)</h2>
+            {crawl_secrets_html}
             <table>
                 <thead>
                     <tr>
@@ -203,6 +257,7 @@ def generate_html_report(report: dict[str, Any], output_path: str) -> None:
                 </thead>
                 <tbody>{c_rows}</tbody>
             </table>
+            {crawl_forms_html}
         </section>"""
 
     stack_badges = "".join(f'<span class="tech-pill">{_esc(t)}</span>' for t in fingerprints) or '<span class="muted">No identificado</span>'

@@ -676,8 +676,15 @@ def parse_page(
     forms_summary = []
     for form in dom_analyzer.forms:
         form_warnings = []
+        input_names_lower = {i["name"].lower() for i in form["inputs"] if i["name"]}
+        input_types_lower = {i["type"].lower() for i in form["inputs"]}
         if form["method"] == "POST" and not form["has_csrf_token"]:
             form_warnings.append("Formulario POST sin campo CSRF aparente")
+        if form["method"] == "GET":
+            if "password" in input_types_lower or any(
+                k in name for name in input_names_lower for k in ("pass", "pwd", "email", "correo", "mensaje", "telefono", "tel")
+            ) or form["action"].lower().endswith((".php", ".asp", ".aspx", ".jsp")):
+                form_warnings.append("Formulario envía datos a script/contacto mediante GET (expone parámetros en URL y logs)")
         if form["action"].startswith("http://"):
             form_warnings.append("El formulario envía datos por HTTP sin cifrar")
         forms_summary.append({
@@ -1018,10 +1025,34 @@ def print_terminal_results(
         print(f"{C.BOLD} [*] 6. RASTREO DE SUBPÁGINAS INTERNAS ({len(crawl_data['pages_crawled'])} visitadas){C.RESET}")
         print(f"{C.CYAN}{'=' * 70}{C.RESET}")
         for p in crawl_data["pages_crawled"]:
+            sec_tag = f", {C.RED}Secretos: {p['secrets_count']}{C.RESET}" if p.get("secrets_count") else ""
             print(
                 f"  - [{p['status_code']}] {p['url']} "
-                f"(Formularios: {p['forms_count']}, Comentarios: {p['comments_count']})"
+                f"(Formularios: {p['forms_count']}, Comentarios: {p['comments_count']}{sec_tag})"
             )
+
+        if crawl_data.get("discovered_secrets"):
+            print(f"\n  {C.RED}{C.BOLD}[!] Secretos descubiertos en subpáginas:{C.RESET}")
+            for sec_type, hits in crawl_data["discovered_secrets"].items():
+                print(f"    {C.RED}[ALERTA CRAWL] {sec_type}:{C.RESET}")
+                for item in hits:
+                    masked = item if len(item) < 15 else item[:8] + "..." + item[-4:]
+                    print(f"      * {masked}")
+
+        if crawl_data.get("discovered_emails"):
+            print(f"\n  [!] Correos descubiertos en subpáginas ({len(crawl_data['discovered_emails'])}):")
+            for em in crawl_data["discovered_emails"]:
+                print(f"    - {em}")
+
+        if crawl_data.get("discovered_forms"):
+            print(f"\n  [!] Formularios descubiertos en subpáginas ({len(crawl_data['discovered_forms'])}):")
+            for idx, form in enumerate(crawl_data["discovered_forms"], 1):
+                warn_str = (
+                    f" | {C.YELLOW}Alertas: {', '.join(form['warnings'])}{C.RESET}"
+                    if form.get("warnings")
+                    else f" | {C.GREEN}OK{C.RESET}"
+                )
+                print(f"    [{idx}] {form['method']} -> {form['action']} ({len(form['inputs'])} inputs){warn_str}")
 
 
 def main():
